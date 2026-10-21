@@ -156,3 +156,29 @@ public:
     }
 
     // Discard partial data. MUST be called when a connection is replaced
+    // (reconnect), or stale half-frames corrupt the new stream.
+    void reset() noexcept { buf_.clear(); start_ = 0; }
+
+    std::size_t buffered() const noexcept { return buf_.size() - start_; }
+
+private:
+    // Drop consumed bytes. Cheap in the common case (everything consumed);
+    // otherwise only moves data once the dead prefix is large.
+    void compact() {
+        if (start_ == buf_.size()) {
+            buf_.clear();
+            start_ = 0;
+        } else if (start_ >= kCompactThreshold) {
+            buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(start_));
+            start_ = 0;
+        }
+    }
+
+    static constexpr std::size_t kCompactThreshold = 64 * 1024;
+    std::vector<std::byte> buf_;
+    std::size_t start_ = 0;
+    std::size_t max_payload_;
+    bool checksum_;
+};
+
+}  // namespace linkway
