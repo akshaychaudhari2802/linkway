@@ -169,3 +169,91 @@ private:
     using Handler = std::function<void(ByteView)>;
     using ServerFn = std::function<void(ByteView, std::uint64_t correlation)>;
     struct Subscription { SubscriptionId id; std::shared_ptr<const Handler> fn; Dispatch dispatch; };
+    struct Server { std::shared_ptr<const ServerFn> fn; Dispatch dispatch; };
+    // Copy-on-write routing table: the receive path reads a snapshot without
+    // locking or copying (v1 copied the subscriber vector for every message).
+    struct Table {
+        std::unordered_map<TypeId, std::vector<Subscription>> subs;
+        std::unordered_map<TypeId, Server> servers;
+    };
+    struct Pending {
+        std::function<void(ByteView)> on_reply;
+        std::function<void(std::error_code)> on_error;
+        TypeId reply_type = 0;   // a reply of any other type is rejected (not just checked by size)
+    };
+
+    Bus(Transport transport, Config cfg);
+
+    std::error_code send(TypeId wire_type, std::uint64_t correlation, ByteView payload);
+    void on_frame(const FrameHeader& h, ByteView payload);   // receiving thread
+    void on_batch_end();
+    void on_state(LinkState s, std::error_code why);
+    void enqueue(Executor::Task&& task);
+    void flush_batch();
+    void drain_backlog();
+    void run_inline(const Handler& fn, ByteView payload) noexcept;
+    std::uint64_t add_pending(Pending p);
+    bool complete_request(std::uint64_t corr, TypeId type, ByteView payload);
+    void send_reply(TypeId wire_type, std::uint64_t corr, ByteView payload, bool inline_dispatch);
+    bool fail_request(std::uint64_t corr, std::error_code ec);
+    void fail_all_pending(std::error_code ec);
+    void update_table(const std::function<void(Table&)>& edit);
+    std::shared_ptr<const Table> table() const { return std::atomic_load(&table_); }
+    const Table& rx_table();   // receiving thread: a cached snapshot, refreshed only when the table changes
+    void release_sigusr1_dump() noexcept;
+
+    template <class T>
+    static ByteView bytes_of(const T& v) noexcept {
+        return {reinterpret_cast<const std::byte*>(&v), sizeof(T)};   // std::byte may alias anything
+    }
+    // Read a T from received bytes: in place when aligned (no copy), else via a copy.
+    template <class T, class H>
+    static void with_message(ByteView payload, H& h);
+
+    // Declaration order = construction order, and REVERSE destruction order.
+    // Threads (executor_, loop_thread_) start LAST, once every member they
+    // touch exists. payload_pool_ is declared before backlog_ and executor_,
+    // whose queued tasks hold payloads: they must be destroyed first.
+    const Config cfg_;
+    Metrics metrics_;
+    Transport transport_;
+    EventLoop loop_;
+    detail::PayloadPool payload_pool_;
+
+    std::mutex table_mu_;                        // serialises writers of table_
+    std::shared_ptr<const Table> table_;         // readers: std::atomic_load
+    std::atomic<std::uint64_t> table_version_{1};
+    std::shared_ptr<const Table> rx_table_;      // receiving thread only
+    std::uint64_t rx_version_ = 0;               // receiving thread only
+    std::atomic<SubscriptionId> next_sub_{1};
+
+    mutable std::mutex pending_mu_;
+    std::unordered_map<std::uint64_t, Pending> pending_;
+    std::atomic<std::uint64_t> next_corr_{1};
+
+    std::vector<Executor::Task> batch_;          // receiving thread only
+    mutable std::mutex backlog_mu_;
+    std::deque<Executor::Task> backlog_;         // tasks the executor had no room for (Block policy)
+    bool paused_ = false;                        // guarded by backlog_mu_
+
+    mutable std::mutex state_mu_;
+    mutable std::condition_variable state_cv_;
+    LinkState state_ = LinkState::Connecting;
+    bool ever_connected_ = false;
+    std::vector<std::function<void(LinkState)>> state_listeners_;   // guarded by state_mu_
+
+    std::atomic<bool> stopping_{false};
+    std::atomic<std::thread::id> poller_{};       // the thread inside poll(), if any
+    const bool serialize_sends_;                  // single-producer transport: one sender at a time
+    mutable std::mutex send_mu_;
+    bool owns_dump_ = false;                     // this Bus's loop reads the SIGUSR1 eventfd
+    Executor executor_;
+    std::thread loop_thread_;
+};
+
+// ======================================================= template definitions
+
+template <class T, class H>
+void Bus::with_message(ByteView payload, H& h) {
+    if (payload.size() != sizeof(T)) return;   // defensive: peer built with a different T
+    if (reinterpret_cast<std::uintptr_t>(payload.data()) % alignof(T) == 0) {
