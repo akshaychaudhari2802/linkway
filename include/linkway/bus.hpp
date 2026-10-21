@@ -81,3 +81,91 @@ public:
     ~Loan();
     Loan(Loan&& o) noexcept;
     Loan& operator=(Loan&&) = delete;
+    Loan(const Loan&) = delete;
+
+private:
+    friend class Bus;
+    explicit Loan(Bus* b) noexcept : bus_(b) {}
+    Bus* bus_;
+    WriteClaim claim_{};
+    T* obj_ = nullptr;
+    bool zero_copy_ = false;
+    bool done_ = false;
+    std::unique_lock<std::mutex> lock_;           // held from reserve() to commit() on a single-producer ring
+    alignas(T) unsigned char local_[sizeof(T)];   // fallback storage when the transport can't lend memory
+};
+
+class Bus {
+public:
+    using Config = BusConfig;
+
+    // Bus owns threads that capture `this`, so it can never move: it lives
+    // behind a unique_ptr. create() returns once the transport is started.
+    static Result<std::unique_ptr<Bus>> create(Transport transport, Config cfg = {});
+    ~Bus();
+    Bus(const Bus&) = delete;
+    Bus& operator=(const Bus&) = delete;
+
+    // ---- publish / subscribe ---------------------------------------------
+    template <class T>
+    std::error_code publish(const T& msg);
+
+    // Zero-copy publish over shared memory (a copying fallback elsewhere, so the
+    // same code works on every transport). WouldBlock if the ring is full.
+    template <class T>
+    Result<Loan<T>> reserve();
+
+    // handler: void(const T&). Worker: runs on a worker thread (default).
+    // Inline: runs on the receiving thread, reading the message in place.
+    // After unsubscribe() returns no NEW deliveries start; one already queued may still run.
+    template <class T, class Handler>
+    SubscriptionId subscribe(Handler&& handler, Dispatch d = Dispatch::Worker);
+    void unsubscribe(SubscriptionId id);
+
+    // ---- request / reply ---------------------------------------------------
+    template <class Req, class Rep>
+    std::future<Result<Rep>> request(const Req& req, std::chrono::milliseconds timeout);
+
+    // Synchronous request. In poll mode it drives poll() itself while waiting;
+    // otherwise it spins for Config::spin, then sleeps. No future, no allocation
+    // for the result.
+    template <class Req, class Rep>
+    Result<Rep> call(const Req& req, std::chrono::milliseconds timeout);
+
+    // handler: Rep(const Req&). Its return value is the reply.
+    template <class Req, class Rep, class Handler>
+    void serve(Handler&& handler, Dispatch d = Dispatch::Worker);
+
+    // ---- v2: receive-side control -------------------------------------------
+    // Poll mode only: receive and dispatch up to `max_frames` on THIS thread.
+    // Returns how many frames were handled. If another thread is polling, or
+    // this is a nested call from a handler, returns 0 at once: the ring has ONE
+    // consumer, and a re-entrant poll would deliver the same slot twice (found in
+    // review: an Inline handler calling call() corrupted the ring).
+    std::size_t poll(std::size_t max_frames = 64);
+    // The largest payload that fits this Bus's transport (and max_message_bytes).
+    std::size_t max_payload() const noexcept;
+    // With BusConfig::start_receiving = false: begin delivering (any thread, once).
+    void start_receiving();
+
+    // Untyped messages, for protocols layered on the Bus (e.g. the durable log).
+    std::error_code publish_raw(TypeId id, ByteView payload);
+    SubscriptionId subscribe_raw(TypeId id, std::function<void(ByteView)> handler, Dispatch d = Dispatch::Worker);
+    // Called on every link state change (loop/rx thread). Keep it short.
+    void on_state_change(std::function<void(LinkState)> fn);
+
+    // ---- observability -----------------------------------------------------
+    const Metrics& metrics() const noexcept { return metrics_; }
+    LinkState state() const;
+    bool wait_until_connected(std::chrono::milliseconds timeout) const;
+    void dump_state(std::ostream& os) const;
+    // `kill -USR1 <pid>` writes dump_state() to out_fd. One LIVE Bus per process
+    // owns it at a time; when that Bus is destroyed, another may take over.
+    bool enable_sigusr1_dump(int out_fd = 2);
+    const Config& config() const noexcept { return cfg_; }
+
+private:
+    template <class T> friend class Loan;
+    using Handler = std::function<void(ByteView)>;
+    using ServerFn = std::function<void(ByteView, std::uint64_t correlation)>;
+    struct Subscription { SubscriptionId id; std::shared_ptr<const Handler> fn; Dispatch dispatch; };
