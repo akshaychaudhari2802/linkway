@@ -345,3 +345,91 @@ SubscriptionId Bus::subscribe(H&& handler, Dispatch d) {
     return id;
 }
 
+template <class Req, class Rep>
+std::future<Result<Rep>> Bus::request(const Req& req, std::chrono::milliseconds timeout) {
+    static_assert(is_registered_v<Req> && is_registered_v<Rep>, "request: both types must be registered");
+    auto prom = std::make_shared<std::promise<Result<Rep>>>();
+    auto fut = prom->get_future();
+    if (stopping_.load(std::memory_order_acquire)) {
+        prom->set_value(Err(ErrorCode::AlreadyStopped));
+        return fut;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const std::uint64_t corr = add_pending(
+        Pending{[this, prom, started](ByteView p) {
+                    if (p.size() != sizeof(Rep)) { prom->set_value(Err(ErrorCode::InvalidFrame)); return; }
+                    Rep r;
+                    std::memcpy(&r, p.data(), sizeof(Rep));
+                    metrics_.round_trip.record(std::chrono::steady_clock::now() - started);
+                    prom->set_value(std::move(r));
+                },
+                [prom](std::error_code ec) { prom->set_value(Err(ec)); }, message_traits<Rep>::id});
+    // The deadline lives on the loop. Whichever of reply/timeout arrives first
+    // removes the entry; the other finds nothing and does nothing.
+    loop_.post([this, corr, timeout] {
+        loop_.add_timer(timeout, [this, corr] { fail_request(corr, ErrorCode::Timeout); });   // counts the timeout
+    });
+    if (auto ec = send(message_traits<Req>::id | kFlagRequest, corr, bytes_of(req))) fail_request(corr, ec);
+    return fut;
+}
+
+template <class Req, class Rep>
+Result<Rep> Bus::call(const Req& req, std::chrono::milliseconds timeout) {
+    static_assert(is_registered_v<Req> && is_registered_v<Rep>, "call: both types must be registered");
+    if (stopping_.load(std::memory_order_acquire)) return Err(ErrorCode::AlreadyStopped);
+    // In poll mode the reply arrives through poll(). Called from a handler that
+    // poll() is running, it could never be delivered (poll is not re-entrant):
+    // refuse instead of waiting for the timeout.
+    if (cfg_.receive == Receive::Poll && poller_.load() == std::this_thread::get_id())
+        return Err(ErrorCode::NotSupported);
+    // The result lives on THIS stack frame; the completion writes into it. So
+    // this function must not return while a completion might still be running
+    // (see the timeout path below).
+    struct Slot {
+        std::atomic<bool> done{false};
+        std::mutex mu;
+        std::condition_variable cv;
+        Rep value{};
+        std::error_code ec;
+        // Notify WHILE holding the lock, and the caller takes the lock once before
+        // returning (below): so the caller cannot destroy this stack object while
+        // the completing thread is still inside notify_one(). (The first version
+        // notified after unlocking; a spinning caller saw `done`, returned, and
+        // the condition variable was destroyed mid-notify. Found by TSan in
+        // Call.WorksInThreadModeWithSpinning.)
+        void finish() {
+            std::lock_guard lock(mu);
+            done.store(true, std::memory_order_release);
+            cv.notify_one();
+        }
+    } slot;
+    const auto started = std::chrono::steady_clock::now();
+    const std::uint64_t corr = add_pending(
+        Pending{[&slot, this, started](ByteView p) {
+                    if (p.size() != sizeof(Rep)) slot.ec = ErrorCode::InvalidFrame;
+                    else std::memcpy(&slot.value, p.data(), sizeof(Rep));
+                    metrics_.round_trip.record(std::chrono::steady_clock::now() - started);
+                    slot.finish();
+                },
+                [&slot](std::error_code ec) { slot.ec = ec; slot.finish(); }, message_traits<Rep>::id});
+    if (auto ec = send(message_traits<Req>::id | kFlagRequest, corr, bytes_of(req))) fail_request(corr, ec);
+
+    const auto deadline = started + timeout;
+    auto is_done = [&] { return slot.done.load(std::memory_order_acquire); };
+    if (cfg_.receive == Receive::Poll) {
+        // Run-to-completion: this thread IS the receiver. Nothing sleeps.
+        while (!is_done() && std::chrono::steady_clock::now() < deadline)
+            if (poll(64) == 0) detail::cpu_relax();
+    } else {
+        const auto spin_until = std::min(deadline, started + cfg_.spin);
+        while (!is_done() && std::chrono::steady_clock::now() < spin_until) detail::cpu_relax();
+        std::unique_lock lock(slot.mu);
+        slot.cv.wait_until(lock, deadline, is_done);
+    }
+    if (!is_done() && fail_request(corr, ErrorCode::Timeout)) { /* we removed it: slot now done */ }
+    // A completion that won the race may still be writing: wait for it.
+    while (!is_done()) std::this_thread::yield();
+    { std::lock_guard lock(slot.mu); }   // ...and until it has left finish() entirely
+    if (slot.ec) return Err(slot.ec);
+    return slot.value;
+}
