@@ -257,3 +257,91 @@ template <class T, class H>
 void Bus::with_message(ByteView payload, H& h) {
     if (payload.size() != sizeof(T)) return;   // defensive: peer built with a different T
     if (reinterpret_cast<std::uintptr_t>(payload.data()) % alignof(T) == 0) {
+        // In place, no copy. T is trivially copyable (LINKWAY_MESSAGE checks), an
+        // implicit-lifetime type: C++20 made reading it from raw bytes well defined
+        // (P0593, implicit object creation), and GCC/Clang compile C++17 the same way.
+        h(*std::launder(reinterpret_cast<const T*>(payload.data())));
+    } else {
+        T msg;
+        std::memcpy(&msg, payload.data(), sizeof(T));
+        h(static_cast<const T&>(msg));
+    }
+}
+
+template <class T>
+std::error_code Bus::publish(const T& msg) {
+    static_assert(is_registered_v<T>,
+                  "publish<T>: T is not registered. Add LINKWAY_MESSAGE(T, id) to a shared header.");
+    if (stopping_.load(std::memory_order_acquire)) return ErrorCode::AlreadyStopped;
+    return send(message_traits<T>::id, 0, bytes_of(msg));
+}
+
+template <class T>
+Result<Loan<T>> Bus::reserve() {
+    static_assert(is_registered_v<T>, "reserve<T>: T is not registered with LINKWAY_MESSAGE");
+    static_assert(alignof(T) <= 8, "reserve<T>: in-place messages must have alignment <= 8");
+    if (stopping_.load(std::memory_order_acquire)) return Err(ErrorCode::AlreadyStopped);
+    Loan<T> loan(this);
+    if (transport_.supports_zero_copy()) {
+        const std::size_t bytes = frame_size(message_traits<T>::id, sizeof(T), cfg_.checksum);
+        if (serialize_sends_) loan.lock_ = std::unique_lock<std::mutex>(send_mu_);
+        WriteClaim c = transport_.claim(bytes);
+        if (!c.data) return Err(c.capacity && bytes > c.capacity ? ErrorCode::MessageTooLarge : ErrorCode::WouldBlock);
+        encode_header(c.data, message_traits<T>::id, 0, sizeof(T), cfg_.checksum);
+        loan.obj_ = ::new (static_cast<void*>(c.data + kBaseHeaderSize)) T{};   // payload is 8-byte aligned in a slot
+        loan.claim_ = c;
+        loan.zero_copy_ = true;
+    } else {
+        loan.obj_ = ::new (static_cast<void*>(loan.local_)) T{};
+    }
+    return loan;
+}
+
+template <class T>
+std::error_code Loan<T>::commit() {
+    if (done_) return ErrorCode::InvalidFrame;
+    done_ = true;
+    if (!zero_copy_) return bus_->publish(*obj_);
+    const std::size_t body = kBaseHeaderSize + sizeof(T);
+    if (bus_->cfg_.checksum) seal_frame(claim_.data, body);
+    const std::size_t bytes = body + (bus_->cfg_.checksum ? kChecksumSize : 0);
+    bus_->transport_.commit(claim_, bytes);
+    bus_->metrics_.messages_sent.fetch_add(1, std::memory_order_relaxed);
+    bus_->metrics_.bytes_sent.fetch_add(bytes, std::memory_order_relaxed);
+    bus_->metrics_.zero_copy_sent.fetch_add(1, std::memory_order_relaxed);
+    if (lock_.owns_lock()) lock_.unlock();
+    return {};
+}
+
+template <class T>
+Loan<T>::~Loan() {
+    if (zero_copy_ && !done_ && bus_) bus_->transport_.commit(claim_, 0);   // cancel: release the slot empty
+}
+
+template <class T>
+Loan<T>::Loan(Loan&& o) noexcept
+    : bus_(std::exchange(o.bus_, nullptr)), claim_(o.claim_), zero_copy_(o.zero_copy_), done_(o.done_),
+      lock_(std::move(o.lock_)) {
+    o.done_ = true;
+    if (zero_copy_) {
+        obj_ = o.obj_;
+    } else if (o.obj_) {
+        std::memcpy(local_, o.local_, sizeof(T));
+        obj_ = std::launder(reinterpret_cast<T*>(local_));
+    }
+}
+
+template <class T, class H>
+SubscriptionId Bus::subscribe(H&& handler, Dispatch d) {
+    static_assert(is_registered_v<T>, "subscribe<T>: T is not registered with LINKWAY_MESSAGE");
+    static_assert(std::is_invocable_v<H&, const T&>,
+                  "subscribe<T>: the handler must be callable as void(const T&)");
+    // Erase the type here, where T is still known. From the outside every handler
+    // is void(ByteView), so one table holds handlers for every message type.
+    auto erased = std::make_shared<const Handler>(
+        [h = std::forward<H>(handler)](ByteView payload) mutable { with_message<T>(payload, h); });
+    const SubscriptionId id = next_sub_.fetch_add(1, std::memory_order_relaxed);
+    update_table([&](Table& t) { t.subs[message_traits<T>::id].push_back(Subscription{id, erased, d}); });
+    return id;
+}
+
