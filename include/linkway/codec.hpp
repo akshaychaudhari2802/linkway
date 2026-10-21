@@ -68,3 +68,91 @@ inline void seal_frame(std::byte* frame, std::size_t body) noexcept {
 }
 
 // Serialize one frame into `out` (resized; capacity reused across calls, so a
+// thread_local buffer makes this allocation-free after the first message).
+inline void encode_frame(std::vector<std::byte>& out, TypeId wire_type, std::uint64_t correlation,
+                         ByteView payload, bool checksum = false) {
+    const std::size_t hs = header_size(wire_type);
+    out.resize(frame_size(wire_type, payload.size(), checksum));
+    encode_header(out.data(), wire_type, correlation, payload.size(), checksum);
+    if (!payload.empty()) std::memcpy(out.data() + hs, payload.data(), payload.size());
+    if (checksum) seal_frame(out.data(), hs + payload.size());
+}
+
+// Header checks shared by both decoders. `require_checksum`: this end insists
+// on CRCs, so a frame without one is refused.
+inline std::error_code check_header(FrameHeader& h, const std::byte* p, std::size_t max_payload,
+                                    bool require_checksum) noexcept {
+    const std::uint32_t word = detail::load_u32(p);
+    h.length = word & kLengthMask;
+    h.checksummed = (word & kFlagChecksum) != 0;
+    h.type = detail::load_u32(p + 4);
+    h.correlation = 0;
+    if (h.id() == 0) return ErrorCode::InvalidFrame;                       // id 0 is reserved
+    if (h.is_request() && h.is_reply()) return ErrorCode::InvalidFrame;
+    // Check BEFORE waiting for the payload: a corrupt length must never
+    // make us buffer (or allocate) gigabytes.
+    if (h.length > max_payload) return ErrorCode::MessageTooLarge;
+    if (require_checksum && !h.checksummed) return ErrorCode::ChecksumMismatch;
+    return {};
+}
+
+// Parse and validate ONE complete frame held in `frame` (a shared-memory slot,
+// or anything else that delivers whole frames). The peer's bytes are untrusted:
+// every field is checked before use. On success `payload` views inside `frame`.
+inline std::error_code decode_frame(ByteView frame, std::size_t max_payload, bool require_checksum,
+                                    FrameHeader& h, ByteView& payload) noexcept {
+    if (frame.size() < kBaseHeaderSize) return ErrorCode::InvalidFrame;
+    if (auto ec = check_header(h, frame.data(), max_payload, require_checksum)) return ec;
+    const std::size_t hs = header_size(h.type);
+    if (frame.size() != frame_size(h.type, h.length, h.checksummed)) return ErrorCode::InvalidFrame;
+    if (hs == kRpcHeaderSize) h.correlation = detail::load_u64(frame.data() + 8);
+    if (h.checksummed &&
+        detail::load_u32(frame.data() + hs + h.length) != detail::crc32c(frame.data(), hs + h.length))
+        return ErrorCode::ChecksumMismatch;
+    payload = ByteView{frame.data() + hs, h.length};
+    return {};
+}
+
+// Reassembles frames from an arbitrarily chunked byte stream.
+//
+// State is a single read offset into buf_. The fixed-size header is simply
+// re-read when more bytes arrive, which is O(1) and removes a whole class of
+// state-machine bugs.
+class FrameReader {
+public:
+    // require_checksum: refuse frames that carry no CRC (frames that do carry
+    // one are always verified).
+    explicit FrameReader(std::size_t max_payload, bool require_checksum = false)
+        : max_payload_(max_payload), checksum_(require_checksum) {}
+
+    // Appends `incoming`, then calls on_frame(const FrameHeader&, ByteView payload)
+    // once per COMPLETE frame. The payload view is valid only during the call.
+    // Returns InvalidFrame/MessageTooLarge on a corrupt stream; the caller must
+    // then close the connection (the stream cannot be resynchronised).
+    template <class OnFrame>
+    std::error_code feed(ByteView incoming, OnFrame&& on_frame) {
+        buf_.insert(buf_.end(), incoming.begin(), incoming.end());
+
+        for (;;) {
+            const std::size_t avail = buf_.size() - start_;
+            if (avail < kBaseHeaderSize) break;                       // need more bytes
+
+            const std::byte* p = buf_.data() + start_;
+            FrameHeader h;
+            if (auto ec = check_header(h, p, max_payload_, checksum_)) return ec;
+
+            const std::size_t hs = header_size(h.type);
+            const std::size_t total = frame_size(h.type, h.length, h.checksummed);
+            if (avail < total) break;                                 // frame incomplete
+            if (hs == kRpcHeaderSize) h.correlation = detail::load_u64(p + 8);
+            if (h.checksummed && detail::load_u32(p + hs + h.length) != detail::crc32c(p, hs + h.length))
+                return ErrorCode::ChecksumMismatch;                   // corrupted: the stream is untrustworthy
+
+            on_frame(static_cast<const FrameHeader&>(h), ByteView{p + hs, h.length});
+            start_ += total;
+        }
+        compact();
+        return {};
+    }
+
+    // Discard partial data. MUST be called when a connection is replaced
