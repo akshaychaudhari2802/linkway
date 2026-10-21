@@ -1,0 +1,11 @@
+# Relocatable: the prefix is derived from where this file is installed.
+prefix=${pcfiledir}/../..
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: linkway
+Description: Typed C++17 message bus over Unix sockets, TCP and shared memory
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -llinkway
+Libs.private: -lpthread -lrt
+Cflags: -I${includedir} -std=c++17
