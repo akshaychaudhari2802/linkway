@@ -433,3 +433,21 @@ Result<Rep> Bus::call(const Req& req, std::chrono::milliseconds timeout) {
     if (slot.ec) return Err(slot.ec);
     return slot.value;
 }
+
+template <class Req, class Rep, class H>
+void Bus::serve(H&& handler, Dispatch d) {
+    static_assert(is_registered_v<Req> && is_registered_v<Rep>, "serve: both types must be registered");
+    static_assert(std::is_same_v<std::invoke_result_t<H&, const Req&>, Rep>,
+                  "serve<Req, Rep>: the handler must be callable as Rep(const Req&)");
+    auto fn = std::make_shared<const ServerFn>(
+        [this, d, h = std::forward<H>(handler)](ByteView payload, std::uint64_t corr) mutable {
+            auto reply = [&](const Req& q) {
+                const Rep r = h(q);
+                send_reply(message_traits<Rep>::id | kFlagReply, corr, bytes_of(r), d == Dispatch::Inline);
+            };
+            with_message<Req>(payload, reply);
+        });
+    update_table([&](Table& t) { t.servers[message_traits<Req>::id] = Server{fn, d}; });
+}
+
+}  // namespace linkway
